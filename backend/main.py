@@ -265,37 +265,63 @@ async def analyze_conversation(request: ConversationRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# WebSocket Endpoint - GERÇEK ZAMANLI ANALİZ
-@app.websocket("/ws/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: str):
+# WebSocket Endpoint - MÜŞTERİ
+@app.websocket("/ws/customer/{client_id}")
+async def customer_websocket(websocket: WebSocket, client_id: str):
     """
-    WebSocket endpoint - Gerçek zamanlı konuşma analizi
-    
-    Client mesaj formatları:
-    
-    1. Konuşma parçası ekle:
-    {
-        "type": "add_text",
-        "text": "Müşteri: Merhaba..."
-    }
-    
-    2. Analiz yap:
-    {
-        "type": "analyze"
-    }
-    
-    3. Buffer'ı temizle:
-    {
-        "type": "clear"
-    }
-    
-    4. Canlı konuşma modu (her mesajda otomatik analiz):
-    {
-        "type": "live_mode",
-        "enabled": true
-    }
+    Müşteri WebSocket endpoint - Sadece mesaj gönderme
     """
+    client_id = f"customer-{client_id}"
+    await manager.connect(websocket, client_id)
     
+    try:
+        await manager.send_personal_message({
+            "type": "connected",
+            "message": "Müşteri olarak bağlandınız",
+            "client_id": client_id,
+            "role": "customer",
+            "timestamp": datetime.now().isoformat()
+        }, client_id)
+        
+        while True:
+            data = await websocket.receive_json()
+            message_type = data.get("type")
+            
+            if message_type == "add_text":
+                text = data.get("text", "")
+                
+                # TÜM client'ların buffer'ına ekle
+                for cid in manager.active_connections.keys():
+                    manager.append_to_buffer(cid, text)
+                
+                # Mesajı broadcast et
+                await manager.broadcast({
+                    "type": "new_message",
+                    "text": text,
+                    "from_client": client_id,
+                    "role": "customer",
+                    "timestamp": datetime.now().isoformat()
+                })
+                
+            elif message_type == "ping":
+                await manager.send_personal_message({
+                    "type": "pong",
+                    "timestamp": datetime.now().isoformat()
+                }, client_id)
+    
+    except WebSocketDisconnect:
+        manager.disconnect(client_id)
+    except Exception as e:
+        print(f"Customer WebSocket Error for {client_id}: {e}")
+        manager.disconnect(client_id)
+
+# WebSocket Endpoint - TEMSILİ
+@app.websocket("/ws/agent/{client_id}")
+async def agent_websocket(websocket: WebSocket, client_id: str):
+    """
+    Temsilci WebSocket endpoint - Mesaj gönderme + Analiz
+    """
+    client_id = f"agent-{client_id}"
     await manager.connect(websocket, client_id)
     live_mode = False
     
@@ -303,8 +329,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         # Hoş geldin mesajı
         await manager.send_personal_message({
             "type": "connected",
-            "message": "WebSocket bağlantısı kuruldu",
+            "message": "Temsilci olarak bağlandınız",
             "client_id": client_id,
+            "role": "agent",
             "timestamp": datetime.now().isoformat()
         }, client_id)
         
@@ -317,12 +344,24 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             if message_type == "add_text":
                 # Konuşma parçası ekle
                 text = data.get("text", "")
-                manager.append_to_buffer(client_id, text)
                 
-                # Onay mesajı gönder
+                # TÜM client'ların buffer'ına ekle (müşteri ve temsilci senkronizasyonu için)
+                for cid in manager.active_connections.keys():
+                    manager.append_to_buffer(cid, text)
+                
+                # Mesajı TÜM bağlı client'lara broadcast et
+                await manager.broadcast({
+                    "type": "new_message",
+                    "text": text,
+                    "from_client": client_id,
+                    "role": "agent",
+                    "timestamp": datetime.now().isoformat()
+                })
+                
+                # Gönderene onay mesajı
                 await manager.send_personal_message({
                     "type": "text_added",
-                    "message": "Metin eklendi",
+                    "message": "Metin eklendi ve paylaşıldı",
                     "current_buffer": manager.get_buffer(client_id),
                     "timestamp": datetime.now().isoformat()
                 }, client_id)

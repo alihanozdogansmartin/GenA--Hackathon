@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import List, Dict, Optional
 import httpx
 import json
+from json import JSONDecodeError
 import os
 from datetime import datetime
 from collections import defaultdict
@@ -227,6 +228,107 @@ async def call_gpt_oss_20b(conversation_text: str) -> Dict:
         print(f"GPT-OSS-20B Error: {e}")
         print(f"Error detail:\n{error_detail}")
         raise HTTPException(status_code=500, detail=f"Model API error: {str(e)}")
+
+
+async def call_gpt_oss_20b_retry(conversation_text: str) -> Dict:
+    base_prompt = ANALYSIS_PROMPT.format(conversation_text=conversation_text)
+
+    retry_prompts = [
+        base_prompt,
+        base_prompt + "\n\nÖNEMLİ: Önceki yanıt geçersizdi. SADECE JSON döndür.",
+        base_prompt + "\n\nUYARI: Açıklama, markdown, kod bloğu YASAK. SADECE geçerli JSON üret."
+    ]
+
+    temperatures = [0.3, 0.2, 0.1]
+    last_error = None
+    last_response = None
+
+    for attempt in range(3):
+        try:
+            print(f"GPT çağrısı (deneme {attempt + 1}/3)")
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": "Sen bir müşteri hizmetleri analiz uzmanısın. Yalnızca geçerli JSON üret."
+                },
+                {
+                    "role": "user",
+                    "content": retry_prompts[attempt]
+                }
+            ]
+
+            response = client.chat.completions.create(
+                model="practicus/gpt-oss-20b-hackathon",
+                messages=messages,
+                temperature=temperatures[attempt],
+                max_tokens=1500,
+                top_p=0.9,
+                frequency_penalty=0.3,
+                presence_penalty=0.2,
+                extra_body={
+                    "metadata": {
+                        "username": username,
+                        "pwd": pwd,
+                    }
+                }
+            )
+
+            model_response = response.choices[0].message.content.strip()
+            last_response = model_response
+
+            # Markdown / fence temizleme
+            if model_response.startswith("```"):
+                model_response = (
+                    model_response
+                    .replace("```json", "")
+                    .replace("```", "")
+                    .strip()
+                )
+
+            analysis = json.loads(model_response)
+
+            required_fields = [
+                "sentiment",
+                "resolution",
+                "agentPerformance",
+                "insights",
+                "metrics"
+            ]
+            for field in required_fields:
+                if field not in analysis:
+                    raise ValueError(f"Eksik alan: {field}")
+
+            # Overall score
+            analysis["overallScore"] = round(
+                (analysis["sentiment"]
+                 + analysis["resolution"]
+                 + analysis["agentPerformance"]) / 3
+            )
+
+            print("✅ Geçerli JSON alındı")
+            return analysis
+
+        except (JSONDecodeError, ValueError) as e:
+            last_error = e
+            print(f"⚠JSON hatası (deneme {attempt + 1}): {e}")
+            print("Model cevabı:")
+            print(last_response)
+
+        except Exception as e:
+            last_error = e
+            print(f"GPT çağrı hatası (deneme {attempt + 1}): {e}")
+
+    # 3 deneme de başarısızsa
+    raise HTTPException(
+        status_code=500,
+        detail={
+            "error": "GPT geçerli JSON üretemedi (3 deneme)",
+            "last_error": str(last_error),
+            "last_response": last_response
+        }
+    )
+
 
 # REST API Endpoints (önceki gibi)
 @app.get("/")

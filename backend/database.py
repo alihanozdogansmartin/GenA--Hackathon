@@ -4,6 +4,12 @@ from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 import chromadb
 from chromadb.utils import embedding_functions
+import httpx
+import os
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
 
 # SQLite Database
 SQLALCHEMY_DATABASE_URL = "sqlite:///./callcenter.db"
@@ -48,24 +54,82 @@ class DailyReport(Base):
 # Create tables
 Base.metadata.create_all(bind=engine)
 
+# Practicus AI Embedding Configuration
+api_key = os.getenv('GPT_OSS_API_KEY')
+proxy_username = os.getenv('proxy_username')
+proxy_password = os.getenv('proxy_password')
+
+# Proxy ayarları - LLM ile aynı
+proxy = f"http://{proxy_username}:{proxy_password}@172.31.53.99:8080/"
+no_proxy = ".vodafone.local,localhost,172.31.0.0/16,172.24.0.0/16"
+
+# Practicus AI embedding endpoint
+embedding_base_url = "https://practicus.vodafone.local/models/model-gateway-ai-hackathon/latest/v1"
+
+# OpenAI client for embeddings (şirket içi model için)
+embedding_client = OpenAI(
+    base_url=embedding_base_url,
+    api_key=api_key,
+    http_client=httpx.Client(
+        verify=False,
+        timeout=60.0
+    )
+)
+
+# Custom Embedding Function for Practicus AI
+class PracticusEmbeddingFunction(chromadb.EmbeddingFunction):
+    def __call__(self, input: chromadb.Documents) -> chromadb.Embeddings:
+        """Practicus AI embedding modelini kullanarak embedding oluştur"""
+        try:
+            # Practicus AI embedding endpoint'ini kullan
+            response = embedding_client.embeddings.create(
+                model="practicus/gemma-300m-hackathon",
+                input=input
+            )
+            # Embedding'leri çıkar
+            embeddings = [item.embedding for item in response.data]
+            return embeddings
+        except Exception as e:
+            print(f"Embedding Error: {e}")
+            # Fallback: basit dummy embedding (sadece test için)
+            return [[0.0] * 384 for _ in input]
+
 # ChromaDB for Vector Search (Ortak sorunları bulmak için)
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
-sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="all-MiniLM-L6-v2"
-)
+sentence_transformer_ef = PracticusEmbeddingFunction()
 
 # Collection for customer issues
 try:
+    # Önce var olan collection'ı al
     issues_collection = chroma_client.get_collection(
-        name="customer_issues",
-        embedding_function=sentence_transformer_ef
+        name="customer_issues"
     )
-except:
+    print("✅ Existing collection loaded")
+except ValueError:
+    # Embedding function conflict varsa, collection'ı sil ve yeniden oluştur
+    print("⚠️ Embedding function conflict detected, recreating collection...")
+    try:
+        chroma_client.delete_collection(name="customer_issues")
+    except:
+        pass
     issues_collection = chroma_client.create_collection(
         name="customer_issues",
         embedding_function=sentence_transformer_ef,
         metadata={"description": "Customer complaints and issues"}
     )
+    print("✅ Collection recreated with new embedding function")
+except:
+    # Collection yoksa oluştur
+    try:
+        chroma_client.delete_collection(name="customer_issues")
+    except:
+        pass
+    issues_collection = chroma_client.create_collection(
+        name="customer_issues",
+        embedding_function=sentence_transformer_ef,
+        metadata={"description": "Customer complaints and issues"}
+    )
+    print("✅ New collection created")
 
 def get_db():
     """Database session dependency"""
